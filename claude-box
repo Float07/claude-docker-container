@@ -1,0 +1,91 @@
+#!/usr/bin/env bash
+# claude-box — run Claude Code in an isolated Ubuntu container, one per project folder.
+#
+#   claude-box build            Build (or rebuild) the image
+#   claude-box                  Open a shell in the container for the current folder
+#   claude-box claude [args]    Run Claude Code directly in the current folder
+#   claude-box <cmd> [args]     Run any command in the container
+#   claude-box stop             Stop and remove this folder's container
+#   claude-box ls               List running claude-box containers
+#   claude-box prune            Stop all claude-box containers
+#
+# Env options:
+#   CLAUDE_BOX_PORTS="3000 8000:8000"   Publish ports (applied when the container is created)
+#   CLAUDE_BOX_GITCONFIG=1              Mount your ~/.gitconfig read-only (name/email for commits)
+set -euo pipefail
+
+IMAGE="${CLAUDE_BOX_IMAGE:-claude-box:latest}"
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+CONFIG_VOLUME="claude-box-config"     # Claude login + settings, shared by all projects
+HISTORY_VOLUME="claude-box-history"   # bash history, shared by all projects
+
+die() { echo "claude-box: $*" >&2; exit 1; }
+
+build() {
+  docker build \
+    --build-arg USER_UID="$(id -u)" \
+    --build-arg USER_GID="$(id -g)" \
+    -t "$IMAGE" "$@" "$SCRIPT_DIR"
+}
+
+project_dir="$(pwd -P)"
+project_name="$(basename "$project_dir" | sed 's/[^a-zA-Z0-9_.-]/-/g')"
+project_hash="$(printf '%s' "$project_dir" | sha1sum | cut -c1-8)"
+container="claude-box-${project_name}-${project_hash}"
+container_dir="/workspace/${project_name}"
+
+ensure_running() {
+  [ "$project_dir" = "$HOME" ] || [ "$project_dir" = "/" ] && \
+    die "refusing to mount $project_dir — cd into a project folder first"
+
+  docker image inspect "$IMAGE" >/dev/null 2>&1 || { echo "Image not found, building…"; build; }
+
+  local state
+  state="$(docker inspect -f '{{.State.Status}}' "$container" 2>/dev/null || true)"
+  case "$state" in
+    running) return ;;
+    exited|created) docker start "$container" >/dev/null; return ;;
+    "") ;;
+    *) docker rm -f "$container" >/dev/null ;;
+  esac
+
+  local args=(
+    -d --name "$container"
+    --hostname claude-box
+    --label claude-box=1
+    --label claude-box.project="$project_dir"
+    -v "$project_dir:$container_dir"
+    -v "$CONFIG_VOLUME:/home/dev/.claude"
+    -v "$HISTORY_VOLUME:/commandhistory"
+    -w "$container_dir"
+    --init
+  )
+  for p in ${CLAUDE_BOX_PORTS:-}; do
+    [[ "$p" == *:* ]] && args+=(-p "$p") || args+=(-p "$p:$p")
+  done
+  if [ "${CLAUDE_BOX_GITCONFIG:-0}" = "1" ] && [ -f "$HOME/.gitconfig" ]; then
+    args+=(-v "$HOME/.gitconfig:/home/dev/.gitconfig:ro")
+  fi
+
+  docker run "${args[@]}" "$IMAGE" sleep infinity >/dev/null
+  echo "Started $container  ($project_dir → $container_dir)"
+}
+
+exec_in() {
+  local tty=(-i)
+  [ -t 0 ] && [ -t 1 ] && tty=(-it)
+  exec docker exec "${tty[@]}" -w "$container_dir" "$container" "$@"
+}
+
+case "${1:-}" in
+  build) shift; build "$@" ;;
+  stop)  docker rm -f "$container" >/dev/null 2>&1 && echo "Removed $container" || echo "Not running" ;;
+  ls)    docker ps -a --filter label=claude-box=1 \
+           --format 'table {{.Names}}\t{{.Status}}\t{{.Label "claude-box.project"}}' ;;
+  prune) ids="$(docker ps -aq --filter label=claude-box=1)"
+         [ -n "$ids" ] && docker rm -f $ids >/dev/null && echo "Removed all claude-box containers" || echo "Nothing to remove" ;;
+  "")    ensure_running; exec_in bash -l ;;
+  claude) shift; ensure_running; exec_in bash -lc 'exec claude "$@"' claude "$@" ;;
+  -h|--help|help) sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//' ;;
+  *)     ensure_running; exec_in bash -lc 'exec "$@"' bash "$@" ;;
+esac
