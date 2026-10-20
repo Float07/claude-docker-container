@@ -73,7 +73,12 @@ ensure_running() {
 
 exec_in() {
   local tty=(-i)
-  [ -t 0 ] && [ -t 1 ] && tty=(-it)
+  if [ -t 0 ] && [ -t 1 ]; then
+    # docker exec defaults to TERM=xterm (8 colors); pass the host terminal's capabilities through
+    tty=(-it -e "TERM=${TERM:-xterm-256color}")
+    [ -n "${COLORTERM:-}" ] && tty+=(-e "COLORTERM=$COLORTERM")
+    [ -n "${TERM_PROGRAM:-}" ] && tty+=(-e "TERM_PROGRAM=$TERM_PROGRAM")
+  fi
   exec docker exec "${tty[@]}" -w "$container_dir" "$container" "$@"
 }
 
